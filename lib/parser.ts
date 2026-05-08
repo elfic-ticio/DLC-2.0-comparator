@@ -1,66 +1,75 @@
 import { ParsedLog } from "@/types";
 
-const SECTION_MARKERS = [
-  "[0]",
-  "[1]",
-  "[2]",
-  "[3]",
-  "[4]",
-  "[5]",
-  "[6]",
-  "[7]",
-];
+const SECTION_MARKERS = ["[0]", "[1]", "[2]", "[3]", "[4]", "[5]", "[6]", "[7]"];
 
 function extractSection(log: string, sectionNum: number): string {
   const start = SECTION_MARKERS[sectionNum];
   const end = SECTION_MARKERS[sectionNum + 1] ?? null;
-
   const startIdx = log.indexOf(start);
   if (startIdx === -1) return "";
-
   const endIdx = end ? log.indexOf(end, startIdx + start.length) : log.length;
   return log.slice(startIdx, endIdx === -1 ? log.length : endIdx);
 }
 
-function extractValue(section: string, key: string): string | null {
-  const lines = section.split("\n");
+/**
+ * Extract a value from a line using multiple formats:
+ *   [ro.product.model]: [TECNO LG7n]
+ *   ro.product.model=TECNO LG7n
+ *   ro.product.model = TECNO LG7n
+ *   getprop ro.product.model TECNO LG7n
+ *   Model: TECNO LG7n
+ *   Model = TECNO LG7n
+ */
+function extractProp(lines: string[], ...keys: string[]): string | null {
   for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith(key + ":") || trimmed.startsWith(key + "=")) {
-      const sep = trimmed.includes(":") ? ":" : "=";
-      const val = trimmed.slice(trimmed.indexOf(sep) + 1).trim();
-      return val || null;
-    }
-    if (trimmed.startsWith(key + " ")) {
-      const val = trimmed.slice(key.length).trim();
-      if (val.startsWith(":") || val.startsWith("=")) return val.slice(1).trim() || null;
-    }
-  }
-  return null;
-}
+    const t = line.trim();
+    for (const key of keys) {
+      const kLow = key.toLowerCase();
+      const tLow = t.toLowerCase();
 
-function extractAllValues(section: string, key: string): string[] {
-  const results: string[] = [];
-  const lines = section.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (
-      trimmed.toLowerCase().includes(key.toLowerCase() + ":") ||
-      trimmed.toLowerCase().includes(key.toLowerCase() + "=") ||
-      trimmed.toLowerCase().startsWith(key.toLowerCase())
-    ) {
-      const idx = Math.max(
-        trimmed.toLowerCase().indexOf(key.toLowerCase() + ":"),
-        trimmed.toLowerCase().indexOf(key.toLowerCase() + "=")
+      // Format: [key]: [value]
+      const bracketMatch = t.match(
+        new RegExp(`\\[${key.replace(/\./g, "\\.")}\\]\\s*:\\s*\\[([^\\]]*)\\]`, "i")
       );
-      if (idx !== -1) {
-        const sep = trimmed[idx + key.length];
-        const val = trimmed.slice(idx + key.length + 1).trim();
-        if (val) results.push(val);
+      if (bracketMatch) {
+        const v = bracketMatch[1].trim();
+        if (v) return v;
+      }
+
+      // Format: key=value  or  key = value
+      if (tLow.startsWith(kLow + "=") || tLow.startsWith(kLow + " =")) {
+        const v = t.slice(t.indexOf("=") + 1).trim();
+        if (v) return v;
+      }
+
+      // Format: key: value  or  key : value
+      if (tLow.startsWith(kLow + ":") || tLow.startsWith(kLow + " :")) {
+        const v = t.slice(t.indexOf(":") + 1).trim();
+        if (v) return v;
+      }
+
+      // Format: getprop key value
+      if (tLow.startsWith("getprop " + kLow)) {
+        const after = t.slice(("getprop " + key).length).trim();
+        if (after.startsWith("=")) {
+          const v = after.slice(1).trim();
+          if (v) return v;
+        } else if (after) {
+          return after;
+        }
+      }
+
+      // Format: key followed by space then value (label format)
+      // Only apply for short simple keys like "model", "manufacturer"
+      if (!key.includes(".") && tLow.startsWith(kLow + " ")) {
+        const rest = t.slice(key.length).trim();
+        if (rest && !rest.startsWith("[") && !rest.toLowerCase().startsWith(kLow)) {
+          return rest;
+        }
       }
     }
   }
-  return results;
+  return null;
 }
 
 export function parseLog(rawLog: string): ParsedLog {
@@ -108,95 +117,192 @@ export function parseLog(rawLog: string): ParsedLog {
     return result;
   }
 
-  // Section [0] — Connected Device
+  // ── Section [0] — Connected Device ─────────────────────────────────────────
   const sec0 = extractSection(rawLog, 0);
   if (sec0) {
     const lines = sec0.split("\n");
-    for (const line of lines) {
-      // "List of devices attached" block — serial is on the next non-empty line
-      if (line.includes("List of devices attached")) {
-        const idx = lines.indexOf(line);
-        for (let i = idx + 1; i < lines.length; i++) {
-          const next = lines[i].trim();
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+
+      // "List of devices attached" — serial is on the next non-empty line
+      if (t.includes("List of devices attached")) {
+        for (let j = i + 1; j < lines.length; j++) {
+          const next = lines[j].trim();
           if (next && !next.startsWith("[")) {
+            // Format: SERIAL\tdevice   or   SERIAL device
             const parts = next.split(/\s+/);
-            if (parts.length >= 1 && parts[0] !== "device") {
+            if (parts[0] && parts[0] !== "device" && parts[0] !== "*") {
               result.serial = parts[0];
             }
             break;
           }
         }
       }
-      // Fallback: explicit "Serial:" line
-      if (line.toLowerCase().includes("serial:")) {
-        const val = line.split(":").slice(1).join(":").trim();
-        if (val && !result.serial) result.serial = val;
+
+      // Serial: VALUE  or  serial number: VALUE
+      if (/serial/i.test(t) && (t.includes(":") || t.includes("="))) {
+        const v = t.split(/[=:]/)[1]?.trim();
+        if (v && !result.serial) result.serial = v;
       }
     }
-    // Try to find serial from adb devices output pattern
-    const serialMatch = sec0.match(/^([A-Za-z0-9]+)\s+device/m);
-    if (serialMatch && !result.serial) {
-      result.serial = serialMatch[1];
+
+    // Fallback regex for "SERIAL device" pattern anywhere in sec0
+    if (!result.serial) {
+      const m = sec0.match(/^([A-Za-z0-9_\-\.]+)\s+device\b/m);
+      if (m && m[1] !== "device") result.serial = m[1];
     }
   }
 
   const noDevice =
-    sec0.includes("error") ||
-    (sec0.includes("List of devices attached") && !result.serial && !rawLog.includes("[1]"));
+    sec0.includes("error: no devices") ||
+    sec0.includes("error: device not found") ||
+    (sec0.includes("List of devices attached") &&
+      !result.serial &&
+      sec0.split("\n").filter((l) => l.trim() && !l.includes("List of devices")).length === 0);
 
-  if (noDevice && !result.serial) {
+  if (noDevice) {
     result.isValid = false;
     result.invalidReason = "INVALID: No device detected. Check ADB connection.";
     return result;
   }
 
-  // Section [1] — Android Version / Manufacturer / Model
+  // ── Section [1] — Android Version / Manufacturer / Model ───────────────────
   const sec1 = extractSection(rawLog, 1);
   if (sec1) {
     const lines = sec1.split("\n");
-    for (const line of lines) {
-      const t = line.trim();
-      if (/manufacturer/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val) result.manufacturer = val;
+
+    result.manufacturer = extractProp(lines,
+      "ro.product.manufacturer",
+      "ro.product.brand",
+      "manufacturer",
+      "brand",
+    );
+
+    result.model = extractProp(lines,
+      "ro.product.model",
+      "ro.product.name",
+      "model",
+    );
+
+    result.androidVersion = extractProp(lines,
+      "ro.build.version.release",
+      "ro.system.build.version.release",
+      "android.version",
+      "release",
+    );
+
+    result.sdkVersion = extractProp(lines,
+      "ro.build.version.sdk",
+      "ro.system.build.version.sdk",
+      "sdk_int",
+      "sdk",
+    );
+
+    result.buildType = extractProp(lines,
+      "ro.build.type",
+      "ro.system.build.type",
+      "build.type",
+      "build_type",
+    );
+
+    // Fallback: scan every line for known prop patterns if still null
+    if (!result.model || !result.manufacturer) {
+      for (const line of lines) {
+        const t = line.trim();
+
+        if (!result.manufacturer) {
+          // [ro.product.manufacturer]: [TECNO]
+          const m = t.match(/ro\.product\.(manufacturer|brand)[^\]]*\]\s*:\s*\[([^\]]+)\]/i)
+            ?? t.match(/ro\.product\.(manufacturer|brand)\s*[=:]\s*(\S+.*)/i);
+          if (m) result.manufacturer = m[2].trim();
+        }
+
+        if (!result.model) {
+          // [ro.product.model]: [TECNO LG7n]
+          const m = t.match(/ro\.product\.(model|name)[^\]]*\]\s*:\s*\[([^\]]+)\]/i)
+            ?? t.match(/ro\.product\.(model|name)\s*[=:]\s*(.+)/i);
+          if (m) result.model = m[2].trim();
+        }
+
+        if (!result.androidVersion) {
+          const m = t.match(/ro\.build\.version\.release[^\]]*\]\s*:\s*\[([^\]]+)\]/i)
+            ?? t.match(/ro\.build\.version\.release\s*[=:]\s*(\S+)/i);
+          if (m) result.androidVersion = m[1].trim();
+        }
+
+        if (!result.sdkVersion) {
+          const m = t.match(/ro\.build\.version\.sdk[^\]]*\]\s*:\s*\[([^\]]+)\]/i)
+            ?? t.match(/ro\.build\.version\.sdk\s*[=:]\s*(\S+)/i);
+          if (m) result.sdkVersion = m[1].trim();
+        }
+
+        if (!result.buildType) {
+          const m = t.match(/ro\.build\.type[^\]]*\]\s*:\s*\[([^\]]+)\]/i)
+            ?? t.match(/ro\.build\.type\s*[=:]\s*(\S+)/i);
+          if (m) result.buildType = m[1].trim();
+        }
       }
-      if (/^model[=:\s]/i.test(t)) {
-        const val = t.replace(/^model[=:\s]+/i, "").trim();
-        if (val) result.model = val;
-      }
-      if (/release|android.version|ro\.build\.version\.release/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val && !result.androidVersion) result.androidVersion = val;
-      }
-      if (/sdk_int|ro\.build\.version\.sdk/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val && !result.sdkVersion) result.sdkVersion = val;
-      }
-      if (/build.type|ro\.build\.type/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val && !result.buildType) result.buildType = val;
+    }
+
+    // Strip brackets from values like "[TECNO LG7n]"
+    for (const k of ["manufacturer", "model", "androidVersion", "sdkVersion", "buildType"] as const) {
+      if (result[k]) {
+        result[k] = (result[k] as string).replace(/^\[|\]$/g, "").trim() || null;
       }
     }
   }
 
-  // Section [2] — Verified Boot & Bootloader
+  // ── Section [2] — Verified Boot & Bootloader ────────────────────────────────
   const sec2 = extractSection(rawLog, 2);
   if (sec2) {
     const lines = sec2.split("\n");
-    for (const line of lines) {
-      const t = line.trim();
-      if (/avb|verified.boot|verifiedBootState/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim()?.toLowerCase();
-        if (val && !result.avbState) result.avbState = val;
+
+    const avb = extractProp(lines,
+      "ro.boot.verifiedbootstate",
+      "ro.boot.veritymode",
+      "verifiedBootState",
+      "avb_state",
+      "avb",
+    );
+    if (avb) result.avbState = avb.toLowerCase();
+
+    // Fallback scan
+    if (!result.avbState) {
+      for (const line of lines) {
+        const t = line.trim();
+        const m = t.match(/verifiedboot[^\]]*\]\s*:\s*\[([^\]]+)\]/i)
+          ?? t.match(/verifiedbootstate\s*[=:]\s*(\S+)/i)
+          ?? t.match(/avb[^\]]*\]\s*:\s*\[([^\]]+)\]/i);
+        if (m) { result.avbState = m[1].trim().toLowerCase(); break; }
       }
-      if (/bootloader|unlocked|lock_state/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val !== undefined && !result.bootloaderStatus) result.bootloaderStatus = val;
+    }
+
+    const bl = extractProp(lines,
+      "ro.boot.flash.locked",
+      "ro.secureboot.lockstate",
+      "bootloader_status",
+      "bootloader",
+      "lock_state",
+    );
+    if (bl) result.bootloaderStatus = bl;
+
+    // Scan for locked/unlocked state
+    if (!result.bootloaderStatus) {
+      for (const line of lines) {
+        const t = line.trim();
+        if (/locked/i.test(t)) {
+          const m = t.match(/\b(locked|unlocked|1|0)\b/i);
+          if (m) {
+            result.bootloaderStatus =
+              m[1].toLowerCase() === "locked" ? "1" :
+              m[1].toLowerCase() === "unlocked" ? "0" : m[1];
+          }
+        }
       }
     }
   }
 
-  // Section [3] — DLC Packages / Trustonic
+  // ── Section [3] — DLC Packages / Trustonic ──────────────────────────────────
   const sec3 = extractSection(rawLog, 3);
   if (sec3) {
     const lines = sec3.split("\n");
@@ -213,7 +319,7 @@ export function parseLog(rawLog: string): ParsedLog {
     }
   }
 
-  // Section [4] — DLC Services in Activity Manager
+  // ── Section [4] — DLC Services in Activity Manager ──────────────────────────
   const sec4 = extractSection(rawLog, 4);
   if (sec4) {
     const serviceMatches = sec4.match(/\* ServiceRecord\{[^}]+\}\s+[\w./]+/g) ?? [];
@@ -223,8 +329,6 @@ export function parseLog(rawLog: string): ParsedLog {
       ...altMatches,
     ];
     result.services = Array.from(new Set(allServices));
-
-    const fullSec4Lower = sec4.toLowerCase();
 
     result.hasGlobalParametersService =
       sec4.includes("GlobalParametersService") &&
@@ -242,59 +346,52 @@ export function parseLog(rawLog: string): ParsedLog {
       sec4.includes("DeviceLockFirebaseMessagingService");
   }
 
-  // Section [5] — CarrierConfig Critical Parameters
+  // ── Section [5] — CarrierConfig Critical Parameters ─────────────────────────
   const sec5 = extractSection(rawLog, 5);
   if (sec5) {
     const lines = sec5.split("\n");
-    let currentKey = "";
 
     for (const line of lines) {
       const t = line.trim();
 
       // SIM state
-      if (/SIM.STATE|sim_state/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val && !result.simState) result.simState = val;
+      if (/SIM.STATE|sim_state|SIM_STATE/i.test(t) && !result.simState) {
+        const v = t.split(/[=:]/)[1]?.trim();
+        if (v) result.simState = v;
       }
 
       // MCC/MNC
-      if (/mccmnc|MCC.*MNC|operator/i.test(t) && !result.mccmnc) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val) result.mccmnc = val;
+      if (/mccmnc|MCC.*MNC|operator_numeric/i.test(t) && !result.mccmnc) {
+        const v = t.split(/[=:]/)[1]?.trim();
+        if (v) result.mccmnc = v;
       }
 
       // ISO country
-      if (/iso.*country|country.iso/i.test(t) && !result.isoCountry) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val) result.isoCountry = val;
+      if (/iso.*country|country.*iso/i.test(t) && !result.isoCountry) {
+        const v = t.split(/[=:]/)[1]?.trim();
+        if (v) result.isoCountry = v;
       }
 
-      // call_screening_app — collect all lines
+      // call_screening_app — collect ALL lines (multi-profile)
       if (/call_screening_app/i.test(t)) {
-        const colonIdx = t.indexOf(":");
-        const eqIdx = t.indexOf("=");
-        const sepIdx = Math.max(colonIdx, eqIdx);
+        const sepIdx = Math.max(t.indexOf(":"), t.indexOf("="));
         if (sepIdx !== -1) {
-          const val = t.slice(sepIdx + 1).trim();
-          if (val) result.callScreeningValues.push(val);
-        } else if (t.length > "call_screening_app".length) {
-          result.callScreeningValues.push(t);
+          const v = t.slice(sepIdx + 1).trim();
+          if (v) result.callScreeningValues.push(v);
         }
       }
 
-      // call_redirection
+      // call_redirection_service_component_name_string
       if (/call_redirection/i.test(t)) {
-        const colonIdx = t.indexOf(":");
-        const eqIdx = t.indexOf("=");
-        const sepIdx = Math.max(colonIdx, eqIdx);
+        const sepIdx = Math.max(t.indexOf(":"), t.indexOf("="));
         if (sepIdx !== -1) {
-          const val = t.slice(sepIdx + 1).trim();
-          if (val) result.callRedirectionValues.push(val);
+          const v = t.slice(sepIdx + 1).trim();
+          if (v) result.callRedirectionValues.push(v);
         }
       }
 
-      // carrier_certificate — collect all lines
-      if (/carrier_certificate|certificate/i.test(t)) {
+      // carrier_certificate_string_array — collect ALL lines
+      if (/carrier_certificate|certificate.*array/i.test(t)) {
         result.carrierCertificateLines.push(t);
         if (t.includes("com.trustonic.telecoms.standard.dlc")) {
           result.detectedCertificates.push("com.trustonic.telecoms.standard.dlc");
@@ -307,43 +404,59 @@ export function parseLog(rawLog: string): ParsedLog {
         }
       }
 
-      // CarrierConfig APK
-      if (/carrierconfig.*apk|apk.*carrierconfig/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val && !result.carrierConfigApk) result.carrierConfigApk = val;
+      // CarrierConfig APK path
+      if (/carrierconfig.*\.apk|\.apk.*carrierconfig/i.test(t) && !result.carrierConfigApk) {
+        const v = t.split(/[=:]/)[1]?.trim();
+        if (v) result.carrierConfigApk = v;
       }
     }
 
-    // Deduplicate certificates
     result.detectedCertificates = Array.from(new Set(result.detectedCertificates));
   }
 
-  // Section [6] — Developer Mode and ADB Status
+  // ── Section [6] — Developer Mode and ADB Status ─────────────────────────────
   const sec6 = extractSection(rawLog, 6);
   if (sec6) {
     const lines = sec6.split("\n");
-    for (const line of lines) {
-      const t = line.trim();
-      if (/developer.mode|development_settings/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val !== undefined && !result.developerMode) result.developerMode = val;
-      }
-      if (/adb|usb.debug/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val !== undefined && !result.usbDebugging) result.usbDebugging = val;
+    const devMode = extractProp(lines,
+      "development_settings_enabled",
+      "developer_mode",
+      "developer.mode",
+    );
+    if (devMode !== null) result.developerMode = devMode;
+
+    const adb = extractProp(lines,
+      "adb_enabled",
+      "usb_debugging",
+      "usb.debug",
+    );
+    if (adb !== null) result.usbDebugging = adb;
+
+    // Fallback line scan
+    if (!result.developerMode || !result.usbDebugging) {
+      for (const line of lines) {
+        const t = line.trim();
+        if (!result.developerMode && /developer|development_settings/i.test(t)) {
+          const v = t.split(/[=:]/)[1]?.trim();
+          if (v !== undefined) result.developerMode = v;
+        }
+        if (!result.usbDebugging && /adb_enabled|usb.debug/i.test(t)) {
+          const v = t.split(/[=:]/)[1]?.trim();
+          if (v !== undefined) result.usbDebugging = v;
+        }
       }
     }
   }
 
-  // Section [7] — Carrier ID
+  // ── Section [7] — Carrier ID ─────────────────────────────────────────────────
   const sec7 = extractSection(rawLog, 7);
   if (sec7) {
     const lines = sec7.split("\n");
     for (const line of lines) {
       const t = line.trim();
       if (/carrier.id|activeCarrier|active_carrier/i.test(t)) {
-        const val = t.split(/[=:]/)[1]?.trim();
-        if (val && !result.activeCarrierCheck) result.activeCarrierCheck = val;
+        const v = t.split(/[=:]/)[1]?.trim();
+        if (v && !result.activeCarrierCheck) result.activeCarrierCheck = v;
       }
     }
   }
